@@ -27,7 +27,8 @@ func loadFont(name string) (*opentype.Font, error) {
 	return opentype.Parse(b)
 }
 
-func ToBDF(ctx context.Context, args []string) error {
+// Run converts a OTF/TTF to BDF.
+func Run(ctx context.Context, args []string) error {
 	var (
 		inName  string
 		outName string
@@ -150,7 +151,7 @@ func toBDF(outFileName string, fontFileName string, fontSize int) error {
 }
 
 func main() {
-	err := ToBDF(context.Background(), os.Args[1:])
+	err := Run(context.Background(), os.Args[1:])
 	if err != nil {
 		log.Fatal(err)
 	}
