@@ -12,7 +12,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/koron/otf2vtfont/internal/bitimg"
+	"github.com/koron/otf2ccbdf/internal/bitimg"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/font/sfnt"
