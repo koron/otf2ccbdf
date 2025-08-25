@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"text/template"
 
 	"github.com/koron/otf2ccbdf/internal/bitimg"
 	"golang.org/x/image/font"
@@ -107,6 +109,13 @@ func (cvt *BDFConverter) Convert(outName string) error {
 	return cvt.writeBody(w)
 }
 
+var headTmpl = template.Must(template.New("head").Parse(`STARTFONT 2.1
+FONT -FreeType-{{.name}}-Medium-R-Normal--{{.pixelSize}}-{{.pointSize}}-72-72-C-{{.averageWidth}}-ISO10646-1
+SIZE {{.size}} 72 72
+FONTBOUNDINGBOX {{.width}} {{.height}} 0 {{.descent}}
+CHARS {{.chars}}
+`))
+
 // writeHeader Writes the BDF header
 func (cvt *BDFConverter) writeHeader(w io.Writer) error {
 	// Count the glyphs and calculate their average width
@@ -123,19 +132,28 @@ func (cvt *BDFConverter) writeHeader(w io.Writer) error {
 		}
 	}
 
-	fmt.Fprintln(w, "STARTFONT 2.1")
-	fmt.Fprintf(w, "FONT -FreeType-%s-Medium-R-Normal--%d-%d-72-72-C-%d-ISO10646-1\n",
-		cvt.name,
-		int(((float64(cvt.size)*10*72)/722.7)+0.5), // PixelSize
-		cvt.size*10,            // PointSize
-		widthSum*10/glyphCount, // AverageWidth
-	)
-	fmt.Fprintf(w, "SIZE %d 72 72\n", cvt.size)
-	fmt.Fprintf(w, "FONTBOUNDINGBOX %d %d 0 %d\n", cvt.fullWidth, cvt.height, -cvt.descent)
-	fmt.Fprintf(w, "CHARS %d\n", glyphCount)
-
-	return nil
+	return headTmpl.Execute(w, map[string]any{
+		"name":         cvt.name,
+		"pixelSize":    int(((float64(cvt.size) * 10 * 72) / 722.7) + 0.5),
+		"pointSize":    cvt.size * 10,
+		"averageWidth": widthSum * 10 / glyphCount,
+		"size":         cvt.size,
+		"width":        cvt.fullWidth,
+		"height":       cvt.height,
+		"descent":      -cvt.descent,
+		"chars":        glyphCount,
+	})
 }
+
+var bodyTmpl = template.Must(template.New("body").Parse(`
+STARTCHAR U+{{printf "%04X" .rune}}
+ENCODING {{.rune}}
+DWIDTH {{.width}} 0
+BBX {{.width}} {{.height}} 0 {{.descent}}
+BITMAP
+{{.bitmap -}}
+ENDCHAR
+`))
 
 // writeBody writes the BDF body (glyphs)
 func (cvt *BDFConverter) writeBody(w io.Writer) error {
@@ -163,18 +181,23 @@ func (cvt *BDFConverter) writeBody(w io.Writer) error {
 		drawer.DrawString(fmt.Sprintf("%c", r))
 
 		// Output a character
-		fmt.Fprintf(w, "\nSTARTCHAR U+%04X\n", r)
-		fmt.Fprintf(w, "ENCODING %d\n", r)
-		fmt.Fprintf(w, "DWIDTH %d %d\n", width, 0)
-		fmt.Fprintf(w, "BBX %d %d %d %d\n", width, cvt.height, 0, -cvt.descent)
-		fmt.Fprintf(w, "BITMAP\n")
+		bb := &bytes.Buffer{}
 		b := img.Bytes()
 		xn := img.Xn()
 		for len(b) > 0 {
-			fmt.Fprintf(w, "%X\n", b[:xn])
+			fmt.Fprintf(bb, "%X\n", b[:xn])
 			b = b[xn:]
 		}
-		fmt.Fprintf(w, "ENDCHAR\n")
+		err := bodyTmpl.Execute(w, map[string]any{
+			"rune":    r,
+			"width":   width,
+			"height":  cvt.height,
+			"descent": -cvt.descent,
+			"bitmap":  bb.String(),
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
