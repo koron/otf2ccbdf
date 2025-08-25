@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"iter"
 	"log"
 	"log/slog"
@@ -55,6 +56,27 @@ func Run(ctx context.Context, args []string) error {
 	return toBDF(outName, inName, size)
 }
 
+func toBDF(outFileName string, fontFileName string, fontSize int) error {
+	fi, err := openFontInfo(fontFileName, fontSize)
+	if err != nil {
+		return err
+	}
+
+	// Open the output file with buffering
+	f, err := os.Create(outFileName)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+
+	if err := writeBDFHeader(w, fi); err != nil {
+		return err
+	}
+	return writeBDFBody(w, fi)
+}
+
 func runeIter(face font.Face, filter func(rune) bool) iter.Seq2[rune, fixed.Int26_6] {
 	if filter == nil {
 		filter = func(rune) bool { return true }
@@ -72,11 +94,24 @@ func runeIter(face font.Face, filter func(rune) bool) iter.Seq2[rune, fixed.Int2
 	}
 }
 
-func toBDF(outFileName string, fontFileName string, fontSize int) error {
+type fontInfo struct {
+	name string
+	face font.Face
+
+	size      int
+	halfWidth int
+	fullWidth int
+	height    int
+
+	ascent  int
+	descent int
+}
+
+func openFontInfo(name string, size int) (*fontInfo, error) {
 	// Load a font from a file, determine its family name, and convert it to a font face.
-	fnt, err := loadFont(fontFileName)
+	fnt, err := loadFont(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	familyName, err := fnt.Name(nil, sfnt.NameIDFamily)
 	if err != nil {
@@ -84,90 +119,90 @@ func toBDF(outFileName string, fontFileName string, fontSize int) error {
 		familyName = "Unknown"
 	}
 	face, err := opentype.NewFace(fnt, &opentype.FaceOptions{
-		Size:    float64(fontSize),
+		Size:    float64(size),
 		DPI:     72,
 		Hinting: font.HintingFull,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer face.Close()
 
-	// Determine the basic properties of a font
-	var (
-		fullWidth  = fontSize
-		halfWidth  = fontSize / 2
-		fontHeight = fontSize
-		ascent     = face.Metrics().Ascent
-		descent    = face.Metrics().Descent
-	)
+	return &fontInfo{
+		name:      familyName,
+		face:      face,
+		size:      size,
+		halfWidth: size / 2,
+		fullWidth: size,
+		height:    size,
+		ascent:    face.Metrics().Ascent.Round(),
+		descent:   face.Metrics().Descent.Round(),
+	}, nil
+}
 
-	// Open the output file with buffering
-	f, err := os.Create(outFileName)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := bufio.NewWriter(f)
-	defer w.Flush()
+func (fi *fontInfo) Close() error {
+	return fi.face.Close()
+}
 
-	// Write the BDF header
-
+// writeBDFHeader Writes the BDF header
+func writeBDFHeader(w io.Writer, fi *fontInfo) error {
 	// Count the glyphs and calculate their average width
 	var (
 		glyphCount = 0
 		widthSum   = 0
 	)
-	for _, adv := range runeIter(face, nil) {
+	for _, adv := range runeIter(fi.face, nil) {
 		glyphCount++
-		if adv.Round() > halfWidth {
-			widthSum += fullWidth
+		if adv.Round() > fi.halfWidth {
+			widthSum += fi.fullWidth
 		} else {
-			widthSum += halfWidth
+			widthSum += fi.halfWidth
 		}
 	}
 
 	fmt.Fprintln(w, "STARTFONT 2.1")
 	fmt.Fprintf(w, "FONT -FreeType-%s-Medium-R-Normal--%d-%d-72-72-C-%d-ISO10646-1\n",
-		familyName,
-		int(((float64(fontSize)*10*72)/722.7)+0.5), // PixelSize
-		fontSize*10,            // PointSize
+		fi.name,
+		int(((float64(fi.size)*10*72)/722.7)+0.5), // PixelSize
+		fi.size*10,             // PointSize
 		widthSum*10/glyphCount, // AverageWidth
 	)
-	fmt.Fprintf(w, "SIZE %d 72 72\n", fontSize)
-	fmt.Fprintf(w, "FONTBOUNDINGBOX %d %d 0 %d\n", fullWidth, fontHeight, -descent.Round())
+	fmt.Fprintf(w, "SIZE %d 72 72\n", fi.size)
+	fmt.Fprintf(w, "FONTBOUNDINGBOX %d %d 0 %d\n", fi.fullWidth, fi.height, -fi.descent)
 	fmt.Fprintf(w, "CHARS %d\n", glyphCount)
 
-	// Write the BDF body (glyphs)
+	return nil
+}
 
-	fullImg := bitimg.New(image.Rect(0, 0, fullWidth, fontHeight))
-	halfImg := bitimg.New(image.Rect(0, 0, halfWidth, fontHeight))
+// writeBDFBody writes the BDF body (glyphs)
+func writeBDFBody(w io.Writer, fi *fontInfo) error {
+	fullImg := bitimg.New(image.Rect(0, 0, fi.fullWidth, fi.height))
+	halfImg := bitimg.New(image.Rect(0, 0, fi.halfWidth, fi.height))
 	drawer := &font.Drawer{
 		Src:  image.NewUniform(color.White),
-		Face: face,
+		Face: fi.face,
 		Dot:  fixed.Point26_6{},
 	}
 
-	for r, adv := range runeIter(face, nil) {
+	for r, adv := range runeIter(fi.face, nil) {
 		var (
-			width = halfWidth
+			width = fi.halfWidth
 			img   = halfImg
 		)
-		if adv.Round() > halfWidth {
-			width = fullWidth
+		if adv.Round() > fi.halfWidth {
+			width = fi.fullWidth
 			img = fullImg
 		}
 
 		img.Clear()
 		drawer.Dst = img
-		drawer.Dot = fixed.Point26_6{X: 0, Y: ascent}
+		drawer.Dot = fixed.Point26_6{X: 0, Y: fixed.I(fi.ascent)}
 		drawer.DrawString(fmt.Sprintf("%c", r))
 
 		// Output a character
 		fmt.Fprintf(w, "\nSTARTCHAR U+%04X\n", r)
 		fmt.Fprintf(w, "ENCODING %d\n", r)
 		fmt.Fprintf(w, "DWIDTH %d %d\n", width, 0)
-		fmt.Fprintf(w, "BBX %d %d %d %d\n", width, fontHeight, 0, -descent.Round())
+		fmt.Fprintf(w, "BBX %d %d %d %d\n", width, fi.height, 0, -fi.descent)
 		fmt.Fprintf(w, "BITMAP\n")
 		b := img.Bytes()
 		xn := img.Xn()
@@ -177,7 +212,6 @@ func toBDF(outFileName string, fontFileName string, fontSize int) error {
 		}
 		fmt.Fprintf(w, "ENDCHAR\n")
 	}
-
 	return nil
 }
 
