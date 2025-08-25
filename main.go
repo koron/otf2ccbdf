@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"iter"
 	"log"
 	"log/slog"
 	"os"
@@ -54,18 +55,34 @@ func Run(ctx context.Context, args []string) error {
 	return toBDF(outName, inName, size)
 }
 
+func runeIter(face font.Face, filter func(rune) bool) iter.Seq2[rune, fixed.Int26_6] {
+	if filter == nil {
+		filter = func(rune) bool { return true }
+	}
+	return func(yield func(rune, fixed.Int26_6) bool) {
+		for r := rune(0); r <= 0xffff; r++ {
+			adv, ok := face.GlyphAdvance(r)
+			if !ok || !filter(r) {
+				continue
+			}
+			if !yield(r, adv) {
+				break
+			}
+		}
+	}
+}
+
 func toBDF(outFileName string, fontFileName string, fontSize int) error {
+	// Load a font from a file, determine its family name, and convert it to a font face.
 	fnt, err := loadFont(fontFileName)
 	if err != nil {
 		return err
 	}
-
 	familyName, err := fnt.Name(nil, sfnt.NameIDFamily)
 	if err != nil {
 		slog.Warn("Failed to get family name, so fell back to \"Unknown\"", "err", err)
 		familyName = "Unknown"
 	}
-
 	face, err := opentype.NewFace(fnt, &opentype.FaceOptions{
 		Size:    float64(fontSize),
 		DPI:     72,
@@ -76,53 +93,68 @@ func toBDF(outFileName string, fontFileName string, fontSize int) error {
 	}
 	defer face.Close()
 
-	halfWidth := fontSize / 2
+	// Determine the basic properties of a font
+	var (
+		fullWidth  = fontSize
+		halfWidth  = fontSize / 2
+		fontHeight = fontSize
+		ascent     = face.Metrics().Ascent
+		descent    = face.Metrics().Descent
+	)
 
-	fullImg := bitimg.New(image.Rect(0, 0, fontSize, fontSize))
-	halfImg := bitimg.New(image.Rect(0, 0, halfWidth, fontSize))
-
-	drawer := &font.Drawer{
-		Src:  image.NewUniform(color.White),
-		Face: face,
-		Dot:  fixed.Point26_6{},
-	}
-	ascent := face.Metrics().Ascent
-	descent := face.Metrics().Descent
-
+	// Open the output file with buffering
 	f, err := os.Create(outFileName)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	w := bufio.NewWriter(f)
 	defer w.Flush()
+
+	// Write the BDF header
+
+	// Count the glyphs and calculate their average width
+	var (
+		glyphCount = 0
+		widthSum   = 0
+	)
+	for _, adv := range runeIter(face, nil) {
+		glyphCount++
+		if adv.Round() > halfWidth {
+			widthSum += fullWidth
+		} else {
+			widthSum += halfWidth
+		}
+	}
 
 	fmt.Fprintln(w, "STARTFONT 2.1")
 	fmt.Fprintf(w, "FONT -FreeType-%s-Medium-R-Normal--%d-%d-72-72-C-%d-ISO10646-1\n",
 		familyName,
 		int(((float64(fontSize)*10*72)/722.7)+0.5), // PixelSize
-		fontSize*10, // PointSize
-		fontSize*10, // AverageWidth
+		fontSize*10,            // PointSize
+		widthSum*10/glyphCount, // AverageWidth
 	)
 	fmt.Fprintf(w, "SIZE %d 72 72\n", fontSize)
-	fmt.Fprintf(w, "FONTBOUNDINGBOX %d %d 0 %d\n", fontSize, fontSize, -descent.Round())
-	//fmt.Fprintf(w, "CHARS %d\n", fnt.NumGlyphs())
+	fmt.Fprintf(w, "FONTBOUNDINGBOX %d %d 0 %d\n", fullWidth, fontHeight, -descent.Round())
+	fmt.Fprintf(w, "CHARS %d\n", glyphCount)
 
-	count := 0
-	for r := rune(0); r <= 0xffff; r++ {
-		// Skip unavailable glyphs
-		adv, ok := face.GlyphAdvance(r)
-		if !ok {
-			continue
-		}
+	// Write the BDF body (glyphs)
 
+	fullImg := bitimg.New(image.Rect(0, 0, fullWidth, fontHeight))
+	halfImg := bitimg.New(image.Rect(0, 0, halfWidth, fontHeight))
+	drawer := &font.Drawer{
+		Src:  image.NewUniform(color.White),
+		Face: face,
+		Dot:  fixed.Point26_6{},
+	}
+
+	for r, adv := range runeIter(face, nil) {
 		var (
 			width = halfWidth
 			img   = halfImg
 		)
 		if adv.Round() > halfWidth {
-			width = fontSize
+			width = fullWidth
 			img = fullImg
 		}
 
@@ -135,7 +167,7 @@ func toBDF(outFileName string, fontFileName string, fontSize int) error {
 		fmt.Fprintf(w, "\nSTARTCHAR U+%04X\n", r)
 		fmt.Fprintf(w, "ENCODING %d\n", r)
 		fmt.Fprintf(w, "DWIDTH %d %d\n", width, 0)
-		fmt.Fprintf(w, "BBX %d %d %d %d\n", width, fontSize, 0, -descent.Round())
+		fmt.Fprintf(w, "BBX %d %d %d %d\n", width, fontHeight, 0, -descent.Round())
 		fmt.Fprintf(w, "BITMAP\n")
 		b := img.Bytes()
 		xn := img.Xn()
@@ -144,7 +176,6 @@ func toBDF(outFileName string, fontFileName string, fontSize int) error {
 			b = b[xn:]
 		}
 		fmt.Fprintf(w, "ENDCHAR\n")
-		count++
 	}
 
 	return nil
